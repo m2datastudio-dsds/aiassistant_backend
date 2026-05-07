@@ -1,0 +1,194 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MembershipRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum ReminderStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum ReminderRecurrence {
+  NONE
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships  OrganizationMember[]
+  conversations Conversation[]
+  favorites    Favorite[]
+  gmailAccounts GmailAccount[]
+  reminders Reminder[]
+
+  @@index([createdAt])
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships OrganizationMember[]
+  conversations Conversation[]
+  favorites    Favorite[]
+  messages    Message[]
+  refreshTokens RefreshToken[]
+  gmailAccounts GmailAccount[]
+  reminders Reminder[]
+}
+
+model OrganizationMember {
+  id             String          @id @default(cuid())
+  organizationId String
+  userId         String
+  role           MembershipRole  @default(MEMBER)
+  createdAt      DateTime        @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+model Conversation {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String?
+  title          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  messages     Message[]
+  favorites    Favorite[]
+
+  @@index([organizationId, updatedAt])
+  @@index([userId, updatedAt])
+}
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String
+  userId         String?
+  role           MessageRole
+  content        String
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  favorites    Favorite[]
+
+  @@index([conversationId, createdAt])
+}
+
+model Favorite {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  conversationId String
+  messageId      String
+  kind           String
+  title          String
+  content        String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  message      Message      @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, messageId])
+  @@index([organizationId, userId, updatedAt])
+  @@index([conversationId, createdAt])
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  revokedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
+
+model GmailAccount {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  email          String
+  displayName    String?
+  accessToken    String
+  refreshToken   String?
+  scope          String?
+  tokenType      String?
+  expiryDate     DateTime?
+  historyId      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@unique([organizationId, email])
+  @@index([organizationId, updatedAt])
+}
+
+model Reminder {
+  id             String             @id @default(cuid())
+  organizationId String
+  userId         String
+  title          String
+  notes          String?
+  dueAt          DateTime
+  timezone       String?
+  status         ReminderStatus     @default(ACTIVE)
+  recurrence     ReminderRecurrence @default(NONE)
+  notificationId String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  completedAt    DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status, dueAt])
+  @@index([userId, dueAt])
+}
+
