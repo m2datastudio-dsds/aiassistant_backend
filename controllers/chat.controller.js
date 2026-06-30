@@ -9,6 +9,15 @@ const createConversationSchema = z.object({
   title: z.string().min(1).max(120).optional()
 });
 
+const locationContextSchema = z
+  .object({
+    latitude: z.number().min(-90).max(90),
+    longitude: z.number().min(-180).max(180),
+    accuracyMeters: z.number().min(0).max(100000).optional(),
+    capturedAt: z.string().trim().max(80).optional()
+  })
+  .optional();
+
 const sendMessageSchema = z.object({
   conversationId: z.string().min(1).optional(),
   message: z.string().min(1),
@@ -22,6 +31,7 @@ const sendMessageSchema = z.object({
       priorities: z.array(z.string().trim().min(1).max(40)).min(1).max(5)
     })
     .optional(),
+  locationContext: locationContextSchema,
   incognito: z.boolean().optional().default(false),
   history: z
     .array(
@@ -49,7 +59,8 @@ const regenerateResponseSchema = z.object({
       experienceLevel: z.enum(["beginner", "intermediate", "advanced"]),
       priorities: z.array(z.string().trim().min(1).max(40)).min(1).max(5)
     })
-    .optional()
+    .optional(),
+  locationContext: locationContextSchema
 });
 
 const editAndResendSchema = z.object({
@@ -64,7 +75,8 @@ const editAndResendSchema = z.object({
       experienceLevel: z.enum(["beginner", "intermediate", "advanced"]),
       priorities: z.array(z.string().trim().min(1).max(40)).min(1).max(5)
     })
-    .optional()
+    .optional(),
+  locationContext: locationContextSchema
 });
 
 const quickActionSchema = z.object({
@@ -80,6 +92,7 @@ const quickActionSchema = z.object({
       priorities: z.array(z.string().trim().min(1).max(40)).min(1).max(5)
     })
     .optional(),
+  locationContext: locationContextSchema,
   incognito: z.boolean().optional().default(false),
   history: z
     .array(
@@ -289,10 +302,434 @@ function buildOnboardingContext(profile) {
   ].join("\n");
 }
 
-async function generateReplyText({ messages, preferredLanguage, onboardingProfile }) {
+function buildLocationContext(locationContext) {
+  if (!locationContext) return null;
+
+  const accuracy = Number.isFinite(locationContext.accuracyMeters)
+    ? `Accuracy: about ${Math.round(locationContext.accuracyMeters)} meters`
+    : null;
+
+  return [
+    "User location context:",
+    `Latitude: ${locationContext.latitude}`,
+    `Longitude: ${locationContext.longitude}`,
+    accuracy,
+    locationContext.capturedAt ? `Captured at: ${locationContext.capturedAt}` : null,
+    "These coordinates are already the user's current location.",
+    "When the user asks for something near me, around me, nearby, local, or based on current location, do not ask for their city, zip code, or coordinates again.",
+    "Use the coordinates as the available location context. If exact live business listings, ratings, opening hours, or routes are needed and no maps/search tool is available, clearly say that live map search is not connected yet and give practical next steps or search terms.",
+    "Do not mention exact coordinates unless useful."
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function getLatestUserText(messages) {
+  for (const message of [...messages].reverse()) {
+    if (message.role === "USER") return String(message.content || "");
+  }
+  return "";
+}
+
+function inferNearbyPlaceRequest(text) {
+  const value = String(text || "").toLowerCase();
+  const isNearby = /\b(near me|nearby|around me|current location|my location|closest|nearest)\b/.test(value);
+  if (!isNearby) return null;
+
+  const mappings = [
+    {
+      pattern: /\b(hospital|hospitals|clinic|clinics|medical|emergency)\b/,
+      type: "hospital",
+      keyword: "hospital",
+      osmSelectors: [
+        { key: "amenity", value: "hospital" },
+        { key: "amenity", value: "clinic" }
+      ]
+    },
+    {
+      pattern: /\b(pharmacy|pharmacies|chemist|medical store)\b/,
+      type: "pharmacy",
+      keyword: "pharmacy",
+      osmSelectors: [
+        { key: "amenity", value: "pharmacy" },
+        { key: "shop", value: "chemist" }
+      ]
+    },
+    {
+      pattern: /\b(restaurant|restaurants|food|dinner|lunch)\b/,
+      type: "restaurant",
+      keyword: "restaurant",
+      osmSelectors: [
+        { key: "amenity", value: "restaurant" },
+        { key: "amenity", value: "fast_food" },
+        { key: "amenity", value: "food_court" }
+      ]
+    },
+    {
+      pattern: /\b(cafe|cafes|coffee|coffee shop)\b/,
+      type: "cafe",
+      keyword: "cafe",
+      osmSelectors: [
+        { key: "amenity", value: "cafe" },
+        { key: "shop", value: "coffee" }
+      ]
+    },
+    {
+      pattern: /\b(atm|cash machine)\b/,
+      type: "atm",
+      keyword: "atm",
+      osmSelectors: [{ key: "amenity", value: "atm" }]
+    },
+    {
+      pattern: /\b(bank|banks)\b/,
+      type: "bank",
+      keyword: "bank",
+      osmSelectors: [
+        { key: "amenity", value: "bank" },
+        { key: "office", value: "financial" }
+      ]
+    },
+    {
+      pattern: /\b(gas|petrol|fuel)\b/,
+      type: "gas_station",
+      keyword: "gas station",
+      osmSelectors: [{ key: "amenity", value: "fuel" }]
+    },
+    {
+      pattern: /\b(police)\b/,
+      type: "police",
+      keyword: "police",
+      osmSelectors: [{ key: "amenity", value: "police" }]
+    },
+    {
+      pattern: /\b(hotel|hotels|stay)\b/,
+      type: "lodging",
+      keyword: "hotel",
+      osmSelectors: [
+        { key: "tourism", value: "hotel" },
+        { key: "tourism", value: "guest_house" },
+        { key: "tourism", value: "hostel" },
+        { key: "tourism", value: "motel" }
+      ]
+    }
+  ];
+
+  return mappings.find((item) => item.pattern.test(value)) || {
+    type: "point_of_interest",
+    keyword: "nearby places",
+    osmSelectors: [
+      { key: "amenity" },
+      { key: "shop" },
+      { key: "tourism" }
+    ]
+  };
+}
+
+function buildOsmAddress(tags = {}) {
+  const line1 = [tags["addr:housenumber"], tags["addr:street"]].filter(Boolean).join(" ");
+  const locality = [
+    tags["addr:suburb"],
+    tags["addr:city"] || tags["addr:town"] || tags["addr:village"],
+    tags["addr:state"]
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  const parts = [line1, locality].filter(Boolean);
+  if (parts.length) return parts.join(", ");
+
+  return (
+    tags["addr:full"] ||
+    tags["contact:street"] ||
+    tags["addr:place"] ||
+    null
+  );
+}
+
+function getOsmCoordinates(element) {
+  const latitude = Number.isFinite(element?.lat)
+    ? element.lat
+    : Number.isFinite(element?.center?.lat)
+    ? element.center.lat
+    : null;
+  const longitude = Number.isFinite(element?.lon)
+    ? element.lon
+    : Number.isFinite(element?.center?.lon)
+    ? element.center.lon
+    : null;
+
+  return { latitude, longitude };
+}
+
+function haversineDistanceMeters(lat1, lon1, lat2, lon2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const earthRadius = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(earthRadius * c);
+}
+
+function looksTooGenericName(name, keyword) {
+  const normalized = String(name || "").trim().toLowerCase();
+  const generic = new Set([
+    "hospital",
+    "pharmacy",
+    "restaurant",
+    "cafe",
+    "atm",
+    "bank",
+    "gas station",
+    "police",
+    "hotel",
+    "nearby places"
+  ]);
+  return !normalized || generic.has(normalized) || normalized === String(keyword || "").trim().toLowerCase();
+}
+
+async function fetchNearbyPlacesFromOsm({ request, locationContext }) {
+  const radius = request.keyword === "nearby places" ? 2500 : 5000;
+  const selectorBlocks = request.osmSelectors.flatMap(({ key, value }) => {
+    const filter = value ? `["${key}"="${value}"]` : `["${key}"]`;
+    return [
+      `node(around:${radius},${locationContext.latitude},${locationContext.longitude})${filter};`,
+      `way(around:${radius},${locationContext.latitude},${locationContext.longitude})${filter};`,
+      `relation(around:${radius},${locationContext.latitude},${locationContext.longitude})${filter};`
+    ];
+  });
+
+  const query = `
+[out:json][timeout:12];
+(
+  ${selectorBlocks.join("\n  ")}
+);
+out center 8;
+`;
+
+  const response = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/plain",
+      "User-Agent": "ai-assistant-mobile/1.0"
+    },
+    body: query
+  });
+
+  if (!response.ok) return null;
+  const data = await response.json();
+  if (!Array.isArray(data.elements) || data.elements.length === 0) return null;
+
+  const seen = new Set();
+  const results = [];
+
+  for (const element of data.elements) {
+    const tags = element.tags || {};
+    const { latitude, longitude } = getOsmCoordinates(element);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) continue;
+
+    const name =
+      tags.name ||
+      tags.brand ||
+      tags.operator ||
+      `${request.keyword[0].toUpperCase()}${request.keyword.slice(1)}`;
+    const address = buildOsmAddress(tags);
+    const distanceMeters = haversineDistanceMeters(
+      locationContext.latitude,
+      locationContext.longitude,
+      latitude,
+      longitude
+    );
+    const genericName = looksTooGenericName(name, request.keyword);
+    if (genericName && !address) continue;
+
+    const dedupeKey = `${name}|${address || ""}|${latitude || ""}|${longitude || ""}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    results.push({
+      name,
+      address,
+      latitude,
+      longitude,
+      distanceMeters,
+      genericName
+    });
+  }
+
+  if (!results.length) return null;
+
+  results.sort((a, b) => {
+    if (a.genericName != b.genericName) return a.genericName ? 1 : -1;
+    if ((a.distanceMeters || 0) != (b.distanceMeters || 0)) {
+      return (a.distanceMeters || 0) - (b.distanceMeters || 0);
+    }
+    if (!!a.address != !!b.address) return a.address ? -1 : 1;
+    return 0;
+  });
+
+  return {
+    source: "OpenStreetMap",
+    keyword: request.keyword,
+    results: results.slice(0, 6).map(({ genericName, ...place }) => place)
+  };
+}
+
+async function fetchNearbyPlacesFromGoogle({ request, locationContext }) {
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return null;
+
+  const params = new URLSearchParams({
+    key: apiKey,
+    location: `${locationContext.latitude},${locationContext.longitude}`,
+    radius: "5000",
+    type: request.type,
+    keyword: request.keyword
+  });
+
+  const response = await fetch(
+    `https://maps.googleapis.com/maps/api/place/nearbysearch/json?${params.toString()}`
+  );
+
+  if (!response.ok) return null;
+  const data = await response.json();
+  if (!Array.isArray(data.results) || data.results.length === 0) return null;
+
+  return {
+    source: "Google Places",
+    keyword: request.keyword,
+    results: data.results.slice(0, 6).map((place) => ({
+      name: place.name,
+      address: place.vicinity,
+      rating: place.rating,
+      userRatingsTotal: place.user_ratings_total,
+      openNow: place.opening_hours?.open_now,
+      latitude: place.geometry?.location?.lat,
+      longitude: place.geometry?.location?.lng,
+      distanceMeters:
+        Number.isFinite(place.geometry?.location?.lat) &&
+        Number.isFinite(place.geometry?.location?.lng)
+          ? haversineDistanceMeters(
+              locationContext.latitude,
+              locationContext.longitude,
+              place.geometry.location.lat,
+              place.geometry.location.lng
+            )
+          : null
+    }))
+  };
+}
+
+async function fetchNearbyPlaces({ text, locationContext }) {
+  const request = inferNearbyPlaceRequest(text);
+  if (!request || !locationContext) return null;
+
+  try {
+    const freeResults = await fetchNearbyPlacesFromOsm({
+      request,
+      locationContext
+    });
+    if (freeResults) return freeResults;
+  } catch (_) {
+    // Fall back to Google only if a key is configured.
+  }
+
+  try {
+    return await fetchNearbyPlacesFromGoogle({
+      request,
+      locationContext
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+function buildNearbyPlacesContext(nearbyPlaces) {
+  if (!nearbyPlaces?.results?.length) return null;
+
+  return [
+    `Live nearby place results from ${nearbyPlaces.source} for "${nearbyPlaces.keyword}":`,
+    ...nearbyPlaces.results.map((place, index) => {
+      const parts = [
+        `${index + 1}. ${place.name}`,
+        place.address ? `Address: ${place.address}` : null,
+        Number.isFinite(place.rating)
+          ? `Rating: ${place.rating}${place.userRatingsTotal ? ` (${place.userRatingsTotal} reviews)` : ""}`
+          : null,
+        typeof place.openNow === "boolean"
+          ? `Open now: ${place.openNow ? "yes" : "no"}`
+          : null,
+        Number.isFinite(place.distanceMeters)
+          ? `Distance: ${place.distanceMeters} m`
+          : null,
+        Number.isFinite(place.latitude) && Number.isFinite(place.longitude)
+          ? `Coordinates: ${place.latitude}, ${place.longitude}`
+          : null
+      ];
+      return parts.filter(Boolean).join(" | ");
+    }),
+    "If a field like ratings or open-now status is missing, do not invent it.",
+    "Use these live results directly. Do not say live map search is unavailable."
+  ].join("\n");
+}
+
+function formatNearbyPlacesReply(nearbyPlaces) {
+  if (!nearbyPlaces?.results?.length) return null;
+
+  const title = `Nearby ${nearbyPlaces.keyword} places from ${nearbyPlaces.source}:`;
+  const lines = nearbyPlaces.results.map((place, index) => {
+    const parts = [`${index + 1}. ${place.name}`];
+    if (place.address) parts.push(`Address: ${place.address}`);
+    if (Number.isFinite(place.rating)) {
+      parts.push(
+        `Rating: ${place.rating}${place.userRatingsTotal ? ` (${place.userRatingsTotal} reviews)` : ""}`
+      );
+    }
+    if (typeof place.openNow === "boolean") {
+      parts.push(`Open now: ${place.openNow ? "yes" : "no"}`);
+    }
+    if (Number.isFinite(place.distanceMeters)) {
+      parts.push(`Distance: ${place.distanceMeters} m`);
+    }
+    if (Number.isFinite(place.latitude) && Number.isFinite(place.longitude)) {
+      parts.push(`Coordinates: ${place.latitude}, ${place.longitude}`);
+    }
+    return parts.join(" | ");
+  });
+
+  return [title, ...lines].join("\n");
+}
+
+async function generateReplyText({ messages, preferredLanguage, onboardingProfile, locationContext }) {
+  const latestUserText = getLatestUserText(messages);
+  const nearbyRequest = inferNearbyPlaceRequest(latestUserText);
   const responseLanguage = inferPreferredLanguage(messages, preferredLanguage);
   const explicitLanguage = normalizeLanguageName(preferredLanguage);
   const onboardingContext = buildOnboardingContext(onboardingProfile);
+  const locationInstructions = buildLocationContext(locationContext);
+  const nearbyPlaces = await fetchNearbyPlaces({
+    text: latestUserText,
+    locationContext
+  });
+  const nearbyPlacesContext = buildNearbyPlacesContext(nearbyPlaces);
+
+  if (nearbyRequest && nearbyPlaces?.results?.length) {
+    return formatNearbyPlacesReply(nearbyPlaces);
+  }
+
+  if (nearbyRequest && locationContext && !nearbyPlaces?.results?.length) {
+    return [
+      `I could not fetch live nearby ${nearbyRequest.keyword} places from the connected place service right now.`,
+      "Please try again in a moment or search with a more specific type like hospital, cafe, ATM, pharmacy, or hotel.",
+      "I am intentionally not guessing nearby area names because you asked for actual nearby places."
+    ].join("\n");
+  }
+
   return generateAssistantReply({
     messages: [
       {
@@ -309,12 +746,28 @@ async function generateReplyText({ messages, preferredLanguage, onboardingProfil
             }
           ]
         : []),
+      ...(locationInstructions
+        ? [
+            {
+              role: "system",
+              content: locationInstructions
+            }
+          ]
+        : []),
+      ...(nearbyPlacesContext
+        ? [
+            {
+              role: "system",
+              content: nearbyPlacesContext
+            }
+          ]
+        : []),
       ...toAiMessages(messages)
     ]
   });
 }
 
-async function generateAndSaveReply({ conversationId, preferredLanguage, onboardingProfile }) {
+async function generateAndSaveReply({ conversationId, preferredLanguage, onboardingProfile, locationContext }) {
   const history = await prisma.message.findMany({
     where: { conversationId },
     orderBy: { createdAt: "asc" },
@@ -324,7 +777,8 @@ async function generateAndSaveReply({ conversationId, preferredLanguage, onboard
   const assistantText = await generateReplyText({
     messages: history,
     preferredLanguage,
-    onboardingProfile
+    onboardingProfile,
+    locationContext
   });
 
   const assistantMsg = await prisma.message.create({
@@ -635,7 +1089,8 @@ async function sendMessage(req, res, next) {
       const assistantText = await generateReplyText({
         messages: [...history, userMessage],
         preferredLanguage: input.preferredLanguage,
-        onboardingProfile: input.onboardingProfile
+        onboardingProfile: input.onboardingProfile,
+        locationContext: input.locationContext
       });
 
       return res.status(201).json({
@@ -691,7 +1146,8 @@ async function sendMessage(req, res, next) {
     const assistantMsg = await generateAndSaveReply({
       conversationId,
       preferredLanguage: input.preferredLanguage,
-      onboardingProfile: input.onboardingProfile
+      onboardingProfile: input.onboardingProfile,
+      locationContext: input.locationContext
     });
 
     // ================= STEP 8: Response =================
@@ -746,7 +1202,8 @@ async function runQuickAction(req, res, next) {
       const assistantText = await generateReplyText({
         messages: [...history, userMessage],
         preferredLanguage: input.preferredLanguage,
-        onboardingProfile: input.onboardingProfile
+        onboardingProfile: input.onboardingProfile,
+        locationContext: input.locationContext
       });
 
       return res.status(201).json({
@@ -800,7 +1257,8 @@ async function runQuickAction(req, res, next) {
     const assistantMsg = await generateAndSaveReply({
       conversationId,
       preferredLanguage: input.preferredLanguage,
-      onboardingProfile: input.onboardingProfile
+      onboardingProfile: input.onboardingProfile,
+      locationContext: input.locationContext
     });
 
     res.status(201).json({
@@ -905,7 +1363,8 @@ async function regenerateResponse(req, res, next) {
     const reply = await generateAndSaveReply({
       conversationId: input.conversationId,
       preferredLanguage: input.preferredLanguage,
-      onboardingProfile: input.onboardingProfile
+      onboardingProfile: input.onboardingProfile,
+      locationContext: input.locationContext
     });
 
     res.status(201).json({
@@ -966,7 +1425,8 @@ async function editAndResendMessage(req, res, next) {
     const reply = await generateAndSaveReply({
       conversationId: input.conversationId,
       preferredLanguage: input.preferredLanguage,
-      onboardingProfile: input.onboardingProfile
+      onboardingProfile: input.onboardingProfile,
+      locationContext: input.locationContext
     });
 
     res.status(201).json({

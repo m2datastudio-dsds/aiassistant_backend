@@ -33,6 +33,10 @@ enum ReminderRecurrence {
   YEARLY
 }
 
+enum HabitFrequency {
+  DAILY
+  WEEKLY
+}
 model Organization {
   id        String   @id @default(cuid())
   name      String
@@ -45,6 +49,7 @@ model Organization {
   favorites    Favorite[]
   gmailAccounts GmailAccount[]
   reminders Reminder[]
+  knowledgeNotes KnowledgeNote[]
 
   @@index([createdAt])
 }
@@ -64,7 +69,10 @@ model User {
   refreshTokens RefreshToken[]
   gmailAccounts GmailAccount[]
   reminders Reminder[]
+  knowledgeNotes KnowledgeNote[]
+  habits Habit[]
 }
+
 
 model OrganizationMember {
   id             String          @id @default(cuid())
@@ -190,5 +198,72 @@ model Reminder {
 
   @@index([organizationId, status, dueAt])
   @@index([userId, dueAt])
+}
+
+model KnowledgeNote {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  title          String
+  content        String
+  tags           String[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, userId, updatedAt])
+  @@index([userId, createdAt])
+}
+model Habit {
+  id              String         @id @default(cuid())
+  userId          String
+  name            String
+  description     String?
+  category        String?
+  targetFrequency HabitFrequency @default(DAILY)
+  reminderTime    String?
+  startDate       DateTime
+  isActive        Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  user  User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  logs  HabitLog[]
+  stats HabitStats?
+
+  @@index([userId, isActive, createdAt])
+  @@index([userId, targetFrequency])
+}
+
+model HabitLog {
+  id        String   @id @default(cuid())
+  habitId   String
+  date      DateTime
+  completed Boolean  @default(true)
+  notes     String?
+  createdAt DateTime @default(now())
+
+  habit Habit @relation(fields: [habitId], references: [id], onDelete: Cascade)
+
+  @@unique([habitId, date])
+  @@index([habitId, date])
+  @@index([date])
+}
+
+model HabitStats {
+  id             String   @id @default(cuid())
+  habitId        String   @unique
+  currentStreak  Int      @default(0)
+  longestStreak  Int      @default(0)
+  completionRate Float    @default(0)
+  totalCompleted Int      @default(0)
+  updatedAt      DateTime @updatedAt
+
+  habit Habit @relation(fields: [habitId], references: [id], onDelete: Cascade)
+
+  @@index([currentStreak])
+  @@index([longestStreak])
 }
 

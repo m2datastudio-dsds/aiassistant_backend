@@ -9,7 +9,8 @@ const { generateAssistantReply } = require("../utils/aiClient");
 const listThreadsSchema = z.object({
   maxResults: z.coerce.number().int().min(1).max(50).optional(),
   pageToken: z.string().min(1).optional(),
-  q: z.string().min(1).optional()
+  q: z.string().min(1).optional(),
+  triage: z.coerce.boolean().optional().default(false)
 });
 
 const recipientListSchema = z.preprocess((value) => {
@@ -404,11 +405,173 @@ function mapThread(thread) {
     lastMessageAt: last.internalDate || null,
     isStarred: labelIds.includes("STARRED"),
     isInTrash: labelIds.includes("TRASH"),
+    isUnread: labelIds.includes("UNREAD"),
     messages
   };
 }
 
-async function listThreads({ userId, organizationId, maxResults = 20, pageToken, query }) {
+function hoursSince(value) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return (Date.now() - parsed.getTime()) / (1000 * 60 * 60);
+}
+
+function heuristicThreadTriage(thread) {
+  const haystack = `${thread.subject} ${thread.snippet}`.toLowerCase();
+  const urgentPattern =
+    /\b(urgent|asap|immediately|important|deadline|today|tomorrow|payment|invoice|issue|problem|blocked|approval|action required|meeting|interview)\b/;
+  const recentHours = hoursSince(thread.lastMessageAt);
+
+  let score = 25;
+  const reasons = [];
+
+  if (thread.isUnread) {
+    score += 28;
+    reasons.push("Unread thread");
+  }
+  if (thread.isStarred) {
+    score += 16;
+    reasons.push("Starred by you");
+  }
+  if (urgentPattern.test(haystack)) {
+    score += 26;
+    reasons.push("Urgent language detected");
+  }
+  if (recentHours != null && recentHours <= 6) {
+    score += 18;
+    reasons.push("Recent activity");
+  } else if (recentHours != null && recentHours <= 24) {
+    score += 10;
+    reasons.push("Updated today");
+  }
+  if (thread.messageCount >= 5) {
+    score += 8;
+    reasons.push("Longer conversation");
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  let priority = "low";
+  if (score >= 72) priority = "high";
+  else if (score >= 45) priority = "medium";
+
+  return {
+    priority,
+    score,
+    reason: reasons[0] || "General inbox item"
+  };
+}
+
+function safeJsonParse(value) {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return null;
+  }
+}
+
+async function aiThreadTriage(threads) {
+  const prompt = [
+    "Classify Gmail inbox threads by importance for a busy professional.",
+    "Return strict JSON only.",
+    'Format: {"threads":[{"id":"thread-id","priority":"high|medium|low","score":0-100,"reason":"short reason"}]}',
+    "Use unread status, urgency in subject/snippet, star status, recency, and likely actionability.",
+    "Keep each reason under 8 words.",
+    "Threads:",
+    JSON.stringify(
+      threads.map((thread) => ({
+        id: thread.id,
+        subject: thread.subject,
+        snippet: thread.snippet,
+        participants: thread.participants,
+        messageCount: thread.messageCount,
+        isStarred: thread.isStarred,
+        isUnread: thread.isUnread,
+        lastMessageAt: thread.lastMessageAt
+      }))
+    )
+  ].join("\n");
+
+  const response = await generateAssistantReply({
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are an email triage assistant. Output only valid JSON with no markdown or commentary."
+      },
+      {
+        role: "user",
+        content: prompt
+      }
+    ]
+  });
+
+  const parsed = safeJsonParse(response);
+  const items = Array.isArray(parsed?.threads) ? parsed.threads : null;
+  if (!items) return null;
+
+  const map = new Map();
+  for (const item of items) {
+    if (!item || !item.id) continue;
+    const priority = ["high", "medium", "low"].includes(String(item.priority))
+      ? String(item.priority)
+      : null;
+    if (!priority) continue;
+    map.set(String(item.id), {
+      priority,
+      score: Math.max(0, Math.min(100, Number(item.score) || 0)),
+      reason: String(item.reason || "").trim() || "AI triaged"
+    });
+  }
+
+  return map;
+}
+
+async function triageThreads(threads) {
+  const heuristicMap = new Map(
+    threads.map((thread) => [thread.id, heuristicThreadTriage(thread)])
+  );
+
+  let aiMap = null;
+  try {
+    aiMap = await aiThreadTriage(threads);
+  } catch {
+    aiMap = null;
+  }
+
+  const priorityRank = { high: 0, medium: 1, low: 2 };
+  const triaged = threads.map((thread) => {
+    const heuristic = heuristicMap.get(thread.id);
+    const ai = aiMap?.get(thread.id);
+    return {
+      ...thread,
+      triagePriority: ai?.priority || heuristic.priority,
+      triageScore: typeof ai?.score === "number" ? ai.score : heuristic.score,
+      triageReason: ai?.reason || heuristic.reason
+    };
+  });
+
+  triaged.sort((a, b) => {
+    const priorityDiff =
+      priorityRank[a.triagePriority] - priorityRank[b.triagePriority];
+    if (priorityDiff != 0) return priorityDiff;
+    const scoreDiff = (b.triageScore || 0) - (a.triageScore || 0);
+    if (scoreDiff != 0) return scoreDiff;
+    return new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0);
+  });
+
+  return triaged;
+}
+
+async function listThreads({
+  userId,
+  organizationId,
+  maxResults = 20,
+  pageToken,
+  query,
+  triage = false
+}) {
   const { gmail } = await getAuthorizedGmailClient({ userId, organizationId });
   const resp = await gmail.users.threads.list({
     userId: "me",
@@ -427,10 +590,12 @@ async function listThreads({ userId, organizationId, maxResults = 20, pageToken,
     threads.push(mapThread(detail.data));
   }
 
+  const normalizedThreads = triage ? await triageThreads(threads) : threads;
+
   return {
-    threads,
+    threads: normalizedThreads,
     nextPageToken: resp.data.nextPageToken || null,
-    resultSizeEstimate: resp.data.resultSizeEstimate || threads.length
+    resultSizeEstimate: resp.data.resultSizeEstimate || normalizedThreads.length
   };
 }
 
@@ -732,7 +897,8 @@ async function getThreads(req, res, next) {
       organizationId,
       maxResults: input.maxResults,
       pageToken: input.pageToken,
-      query: input.q
+      query: input.q,
+      triage: input.triage
     });
 
     res.json(result);

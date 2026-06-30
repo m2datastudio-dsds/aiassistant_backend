@@ -19,7 +19,8 @@ const createReminderSchema = z.object({
   dueAt: z.coerce.date(),
   timezone: z.string().trim().max(80).optional().default(""),
   recurrence: z.enum(recurrenceValues).optional().default("NONE"),
-  notificationId: z.string().trim().max(160).optional().default("")
+  notificationId: z.string().trim().max(160).optional().default(""),
+  status: z.enum(["ACTIVE", "COMPLETED", "CANCELLED"]).optional().default("ACTIVE")
 });
 
 const aiReminderSchema = z.object({
@@ -435,7 +436,9 @@ async function createReminder(req, res, next) {
     if (!userId) throw new HttpError(401, "Unauthorized");
     const organizationId = await resolveOrgId(req);
     const input = createReminderSchema.parse(req.body || {});
-    ensureFutureDueAt(input.dueAt);
+    if (input.status === "ACTIVE") {
+      ensureFutureDueAt(input.dueAt);
+    }
 
     const reminder = await prisma.reminder.create({
       data: {
@@ -446,7 +449,9 @@ async function createReminder(req, res, next) {
         dueAt: input.dueAt,
         timezone: normalizeTimezone(input.timezone),
         recurrence: input.recurrence,
-        notificationId: input.notificationId || null
+        notificationId: input.notificationId || null,
+        status: input.status,
+        completedAt: input.status === "COMPLETED" ? new Date() : null
       }
     });
 
@@ -490,9 +495,9 @@ async function updateReminder(req, res, next) {
     if (!userId) throw new HttpError(401, "Unauthorized");
     const organizationId = await resolveOrgId(req);
     const input = updateReminderSchema.parse(req.body || {});
-    if (input.dueAt) ensureFutureDueAt(input.dueAt);
-
-    await ensureReminder({ id: req.params.id, organizationId, userId });
+    const current = await ensureReminder({ id: req.params.id, organizationId, userId });
+    const nextStatus = input.status || current.status;
+    if (input.dueAt && nextStatus === "ACTIVE") ensureFutureDueAt(input.dueAt);
 
     const reminder = await prisma.reminder.update({
       where: { id: req.params.id },
